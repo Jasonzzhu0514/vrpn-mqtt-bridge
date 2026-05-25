@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=%h/.config/vrpn-mqtt-bridge/vrpn-mqtt-bridge.env
-ExecStart=%h/.local/opt/vrpn-mqtt-bridge/.venv/bin/vrpn-mqtt-bridge
+ExecStart=%h/.local/opt/vrpn-mqtt-bridge/bin/vrpn-mqtt-bridge
 Restart=on-failure
 RestartSec=3
 

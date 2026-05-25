@@ -14,7 +14,7 @@ usage() {
   cat <<'USAGE'
 Usage: scripts/deploy-vrpn-mqtt.sh [options]
 
-One-click build + deploy flow for a native VRPN tracker on tracker0:3883.
+One-command build + deploy flow for the C++ VRPN-to-MQTT bridge.
 
 Options:
   --prefix DIR          Install location
@@ -61,11 +61,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-"${REPO_DIR}/scripts/preflight.sh" --env-file "${ENV_FILE}"
-"${REPO_DIR}/scripts/build.sh" --require-native
+"${REPO_DIR}/scripts/build.sh"
 
 DEPLOY_ARGS=(
-  --wheel "${REPO_DIR}/dist/vrpn_mqtt_bridge-0.1.0-py3-none-any.whl"
+  --bridge-bin "${REPO_DIR}/native/vrpn_mqtt_bridge/build/vrpn-mqtt-bridge"
   --env-file "${ENV_FILE}"
   --prefix "${PREFIX}"
   --config-file "${CONFIG_FILE}"
@@ -80,12 +79,7 @@ fi
 
 "${REPO_DIR}/scripts/deploy.sh" "${DEPLOY_ARGS[@]}"
 
-if [[ -x "${PREFIX}/.venv/bin/vrpn-mqtt-bridge" ]]; then
-  COMMAND_PATH="${PREFIX}/.venv/bin/vrpn-mqtt-bridge"
-else
-  COMMAND_PATH="${PREFIX}/bin/vrpn-mqtt-bridge"
-fi
-
+COMMAND_PATH="${PREFIX}/bin/vrpn-mqtt-bridge"
 "${REPO_DIR}/scripts/preflight.sh" --env-file "${CONFIG_FILE}" --command "${COMMAND_PATH}"
 
 cat <<EOF
@@ -94,7 +88,4 @@ Deployment complete.
 
 Run manually:
   ${COMMAND_PATH} --env-file ${CONFIG_FILE}
-
-Expected VRPN endpoint:
-  tracker0@127.0.0.1:3883
 EOF
