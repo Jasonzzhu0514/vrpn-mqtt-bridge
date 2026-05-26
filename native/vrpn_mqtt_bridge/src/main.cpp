@@ -33,6 +33,9 @@ std::atomic<bool> g_should_exit{false};
 constexpr double kDefaultMaxMqttRateHz = 10.0;
 constexpr int kPosePrecision = 5;
 constexpr int kMetricPrecision = 3;
+constexpr std::size_t kMinPanelWidth = 70;
+constexpr std::size_t kGroupColumnWidth = 12;
+constexpr std::size_t kItemColumnWidth = 16;
 
 struct Options {
     std::string env_file;
@@ -56,7 +59,7 @@ struct Options {
     double timeout_sec = 5.0;
     double z_offset = 0.0;
     bool invert_yaw = false;
-    bool dry_run = false;
+    bool vrpn_only = false;
     bool quiet = false;
 };
 
@@ -104,6 +107,25 @@ std::string local_time_text() {
     return buffer;
 }
 
+std::string duration_text(double seconds) {
+    if (seconds < 0) {
+        seconds = 0;
+    }
+    const auto total = static_cast<std::int64_t>(seconds);
+    const auto days = total / 86400;
+    const auto hours = (total % 86400) / 3600;
+    const auto minutes = (total % 3600) / 60;
+    const auto secs = total % 60;
+    std::ostringstream out;
+    if (days > 0) {
+        out << days << "d ";
+    }
+    out << std::setfill('0') << std::setw(2) << hours << ":"
+        << std::setw(2) << minutes << ":"
+        << std::setw(2) << secs;
+    return out.str();
+}
+
 void print_usage(const char* exe) {
     std::cout
         << "Usage: " << exe << " [options]\n"
@@ -129,7 +151,7 @@ void print_usage(const char* exe) {
         << "  --timeout-sec SEC         Stalled threshold (default 5)\n"
         << "  --z-offset METERS         Add offset to z\n"
         << "  --invert-yaw              Invert yaw sign\n"
-        << "  --dry-run                 Run without connecting to MQTT\n"
+        << "  --vrpn-only               Read VRPN without connecting to MQTT\n"
         << "  --quiet                   Suppress terminal status display\n"
         << "  --sample-ms MS            VRPN poll sleep in milliseconds (default 2)\n"
         << "  -h, --help                Show this help\n";
@@ -221,7 +243,7 @@ void apply_config(Options& opts, const std::string& key, const std::string& valu
     else if (key == "VRPN_TIMEOUT_SEC" || key == "SLAM_TIMEOUT_SEC") opts.timeout_sec = std::atof(value.c_str());
     else if (key == "VRPN_Z_OFFSET") opts.z_offset = std::atof(value.c_str());
     else if (key == "VRPN_INVERT_YAW") opts.invert_yaw = env_bool(value, opts.invert_yaw);
-    else if (key == "VRPN_DRY_RUN") opts.dry_run = env_bool(value, opts.dry_run);
+    else if (key == "VRPN_ONLY") opts.vrpn_only = env_bool(value, opts.vrpn_only);
     else if (key == "VRPN_QUIET") opts.quiet = env_bool(value, opts.quiet);
     else if (key == "VRPN_SAMPLE_MS") opts.sample_ms = std::atoi(value.c_str());
 }
@@ -319,8 +341,8 @@ Options parse_args(int argc, char** argv) {
             opts.z_offset = std::atof(argv[++i]);
         } else if (arg == "--invert-yaw") {
             opts.invert_yaw = true;
-        } else if (arg == "--dry-run") {
-            opts.dry_run = true;
+        } else if (arg == "--vrpn-only") {
+            opts.vrpn_only = true;
         } else if (arg == "--quiet") {
             opts.quiet = true;
         } else if (arg == "--sample-ms") {
@@ -581,14 +603,28 @@ std::string frequency_payload(const Options& opts, double vrpn_hz, double mqtt_h
     return out.str();
 }
 
-void publish_or_skip(MqttClient& mqtt, const Options& opts, const std::string& topic, const std::string& payload, bool retain = false) {
-    if (opts.dry_run) {
-        return;
+bool publish_or_skip(MqttClient& mqtt,
+                     const Options& opts,
+                     const std::string& topic,
+                     const std::string& payload,
+                     std::string& mqtt_status,
+                     bool retain = false) {
+    if (opts.vrpn_only) {
+        mqtt_status = "disabled";
+        return false;
     }
-    mqtt.publish(topic, payload, retain);
+    try {
+        mqtt.publish(topic, payload, retain);
+        mqtt_status = "ok";
+        return true;
+    } catch (const std::exception&) {
+        mqtt.close();
+        mqtt_status = "error";
+        return false;
+    }
 }
 
-std::string cell(const std::string& value, std::size_t width, bool right_align = false) {
+std::string center_cell(const std::string& value, std::size_t width) {
     if (width == 0) {
         return "";
     }
@@ -598,8 +634,10 @@ std::string cell(const std::string& value, std::size_t width, bool right_align =
         }
         return value.substr(0, width - 1) + "~";
     }
-    const std::string padding(width - value.size(), ' ');
-    return right_align ? padding + value : value + padding;
+    const std::size_t total_padding = width - value.size();
+    const std::size_t left_padding = total_padding / 2;
+    const std::size_t right_padding = total_padding - left_padding;
+    return std::string(left_padding, ' ') + value + std::string(right_padding, ' ');
 }
 
 std::size_t terminal_columns() {
@@ -622,26 +660,44 @@ std::string trim_to_terminal(std::string line) {
     return line;
 }
 
-std::string live_status_header() {
-    return cell("TIME", 19) + " " +
-           cell("MOD", 3) + " " +
-           cell("TRACKER", 16) + " " +
-           cell("STATUS", 7) + " " +
-           cell("AGE", 4, true) + " " +
-           cell("VRPN", 5, true) + " " +
-           cell("MQTT", 5, true) + " " +
-           cell("X", 9, true) + " " +
-           cell("Y", 9, true) + " " +
-           cell("Z", 9, true) + " " +
-           cell("YAW", 10, true);
+std::size_t panel_width() {
+    const std::size_t columns = terminal_columns();
+    if (columns <= kMinPanelWidth + 1) {
+        return kMinPanelWidth;
+    }
+    return columns - 1;
 }
 
-std::string live_status_line(const Options& opts,
-                             const RuntimeState& state,
-                             const std::string& status,
-                             double age_sec,
-                             double vrpn_hz,
-                             double mqtt_hz) {
+std::size_t value_column_width(std::size_t width) {
+    const std::size_t fixed_width = kGroupColumnWidth + kItemColumnWidth + 10;
+    if (width <= fixed_width) {
+        return 32;
+    }
+    return width - fixed_width;
+}
+
+std::string panel_border(std::size_t width) {
+    return "x" + std::string(width - 2, '=') + "x";
+}
+
+std::string panel_title(const std::string& value, std::size_t width) {
+    return "| " + center_cell(value, width - 4) + " |";
+}
+
+std::string panel_rule(std::size_t width) {
+    return "|" + std::string(width - 2, '-') + "|";
+}
+
+std::string panel_table_row(const std::string& group,
+                            const std::string& item,
+                            const std::string& value,
+                            std::size_t width) {
+    return "| " + center_cell(group, kGroupColumnWidth) +
+           " | " + center_cell(item, kItemColumnWidth) +
+           " | " + center_cell(value, value_column_width(width)) + " |";
+}
+
+std::vector<std::string> live_pose_values(const Options& opts, const RuntimeState& state) {
     std::string x = "-";
     std::string y = "-";
     std::string z = "-";
@@ -655,17 +711,45 @@ std::string live_status_line(const Options& opts,
         yaw = format_decimal(normalize_yaw(current_yaw), kPosePrecision);
     }
 
-    return cell(local_time_text(), 19) + " " +
-           cell(opts.dry_run ? "dry" : "run", 3) + " " +
-           cell(opts.tracker, 16) + " " +
-           cell(status, 7) + " " +
-           cell(age_sec < 0 ? "-" : format_decimal(age_sec, 1), 4, true) + " " +
-           cell(format_decimal(vrpn_hz, 1), 5, true) + " " +
-           cell(format_decimal(mqtt_hz, 1), 5, true) + " " +
-           cell(x, 9, true) + " " +
-           cell(y, 9, true) + " " +
-           cell(z, 9, true) + " " +
-           cell(yaw, 10, true);
+    return {x, y, z, yaw};
+}
+
+std::string mode_text(const Options& opts) {
+    return opts.vrpn_only ? "vrpn-only" : "normal";
+}
+
+std::vector<std::string> live_status_table(const Options& opts,
+                                           const RuntimeState& state,
+                                           const std::string& vrpn_status,
+                                           const std::string& mqtt_status,
+                                           double duration_sec,
+                                           double age_sec,
+                                           double vrpn_hz,
+                                           double mqtt_hz) {
+    const std::vector<std::string> pose = live_pose_values(opts, state);
+    const std::size_t width = panel_width();
+    return {panel_border(width),
+            panel_title("VRPN MQTT Bridge", width),
+            panel_rule(width),
+            panel_table_row("GROUP", "ITEM", "VALUE", width),
+            panel_rule(width),
+            panel_table_row("OVERVIEW", "time", local_time_text(), width),
+            panel_table_row("OVERVIEW", "duration", duration_text(duration_sec), width),
+            panel_table_row("OVERVIEW", "mode", mode_text(opts), width),
+            panel_table_row("OVERVIEW", "tracker", opts.tracker, width),
+            panel_rule(width),
+            panel_table_row("VRPN", "status", vrpn_status, width),
+            panel_table_row("VRPN", "lag", age_sec < 0 ? "-" : format_decimal(age_sec, 1), width),
+            panel_table_row("VRPN", "rec_hz", format_decimal(vrpn_hz, 1), width),
+            panel_rule(width),
+            panel_table_row("MQTT", "status", mqtt_status, width),
+            panel_table_row("MQTT", "pub_hz", format_decimal(mqtt_hz, 1), width),
+            panel_rule(width),
+            panel_table_row("DATA", "x", pose[0], width),
+            panel_table_row("DATA", "y", pose[1], width),
+            panel_table_row("DATA", "z", pose[2], width),
+            panel_table_row("DATA", "yaw", pose[3], width),
+            panel_border(width)};
 }
 
 class LiveStatus {
@@ -678,20 +762,29 @@ class LiveStatus {
 
     void render(const Options& opts,
                 const RuntimeState& state,
-                const std::string& status,
+                const std::string& vrpn_status,
+                const std::string& mqtt_status,
+                double duration_sec,
                 double age_sec,
                 double vrpn_hz,
                 double mqtt_hz) {
         if (!enabled_) {
             return;
         }
-        if (!printed_) {
-            std::cout << trim_to_terminal(live_status_header()) << "\n";
+        const auto lines = live_status_table(opts, state, vrpn_status, mqtt_status, duration_sec, age_sec, vrpn_hz, mqtt_hz);
+        if (printed_ && line_count_ > 0) {
+            std::cout << "\033[" << line_count_ << "A";
+        } else {
             printed_ = true;
         }
-        std::cout << "\r\033[2K"
-                  << trim_to_terminal(live_status_line(opts, state, status, age_sec, vrpn_hz, mqtt_hz))
-                  << std::flush;
+        line_count_ = lines.size();
+        for (std::size_t i = 0; i < lines.size(); ++i) {
+            std::cout << "\r\033[2K" << trim_to_terminal(lines[i]);
+            if (i + 1 < lines.size()) {
+                std::cout << "\n";
+            }
+        }
+        std::cout << "\n" << std::flush;
     }
 
     void finish() {
@@ -704,6 +797,7 @@ class LiveStatus {
    private:
     bool enabled_ = false;
     bool printed_ = false;
+    std::size_t line_count_ = 0;
 };
 
 void print_startup_config(const Options& opts) {
@@ -712,7 +806,7 @@ void print_startup_config(const Options& opts) {
     }
     std::cout << "VRPN MQTT Bridge\n"
               << "  time: " << local_time_text() << "\n"
-              << "  mode: " << (opts.dry_run ? "dry-run" : "run") << "\n"
+              << "  mode: " << mode_text(opts) << "\n"
               << "  route: VRPN " << opts.tracker << "@"
               << opts.vrpn_host << ":" << opts.vrpn_port
               << " -> MQTT " << opts.mqtt_host << ":" << opts.mqtt_port << "\n"
@@ -763,23 +857,23 @@ int main(int argc, char** argv) {
 
         print_startup_config(opts);
 
+        const double started_at = now_sec();
         MqttClient mqtt(opts);
-        if (!opts.dry_run) {
-            mqtt.connect();
-            publish_or_skip(mqtt, opts, opts.status_topic, status_payload(opts, "waiting", -1.0), true);
-        }
+        std::string mqtt_status = opts.vrpn_only ? "disabled" : "init";
+
+        LiveStatus live_status(opts);
+        live_status.render(opts, state, "waiting", mqtt_status, 0.0, -1.0, 0.0, 0.0);
 
         std::unique_ptr<vrpn_Tracker_Remote> tracker(new vrpn_Tracker_Remote(opts.endpoint.c_str()));
         tracker->register_change_handler(&state, &handle_tracker);
 
-        LiveStatus live_status(opts);
         double last_publish = 0.0;
         double last_status = 0.0;
         double last_render = 0.0;
         double stat_at = now_sec();
         double latest_vrpn_hz = 0.0;
         double latest_mqtt_hz = 0.0;
-        std::string latest_status = "waiting";
+        std::string latest_vrpn_status = "waiting";
         std::uint64_t vrpn_count_at_stat = 0;
         std::uint64_t mqtt_count_at_stat = 0;
         std::uint64_t mqtt_count = 0;
@@ -792,24 +886,26 @@ int main(int argc, char** argv) {
 
             const double now = now_sec();
             if (state.has_pose && now - last_publish >= 1.0 / opts.max_mqtt_rate_hz) {
-                publish_or_skip(mqtt, opts, opts.pose_topic, pose_payload(opts, state.latest_pose));
-                publish_or_skip(mqtt, opts, opts.yaw_topic, yaw_payload(opts, state.latest_pose));
-                mqtt_count += 1;
+                const bool pose_ok = publish_or_skip(mqtt, opts, opts.pose_topic, pose_payload(opts, state.latest_pose), mqtt_status);
+                const bool yaw_ok = publish_or_skip(mqtt, opts, opts.yaw_topic, yaw_payload(opts, state.latest_pose), mqtt_status);
+                if (pose_ok && yaw_ok) {
+                    mqtt_count += 1;
+                }
                 last_publish = now;
             }
 
             if (now - last_status >= opts.status_interval_sec) {
                 const double age = state.has_pose ? now - state.last_vrpn_wall_sec : -1.0;
-                latest_status = "waiting";
-                if (state.has_pose && age <= opts.timeout_sec) latest_status = "running";
-                if (state.has_pose && age > opts.timeout_sec) latest_status = "stalled";
-                publish_or_skip(mqtt, opts, opts.status_topic, status_payload(opts, latest_status, age), true);
+                latest_vrpn_status = "waiting";
+                if (state.has_pose && age <= opts.timeout_sec) latest_vrpn_status = "running";
+                if (state.has_pose && age > opts.timeout_sec) latest_vrpn_status = "stalled";
+                publish_or_skip(mqtt, opts, opts.status_topic, status_payload(opts, latest_vrpn_status, age), mqtt_status, true);
 
                 const double dt = now - stat_at;
                 if (dt > 0) {
                     latest_vrpn_hz = static_cast<double>(state.vrpn_count - vrpn_count_at_stat) / dt;
                     latest_mqtt_hz = static_cast<double>(mqtt_count - mqtt_count_at_stat) / dt;
-                    publish_or_skip(mqtt, opts, opts.frequency_topic, frequency_payload(opts, latest_vrpn_hz, latest_mqtt_hz));
+                    publish_or_skip(mqtt, opts, opts.frequency_topic, frequency_payload(opts, latest_vrpn_hz, latest_mqtt_hz), mqtt_status);
                     vrpn_count_at_stat = state.vrpn_count;
                     mqtt_count_at_stat = mqtt_count;
                     stat_at = now;
@@ -819,7 +915,7 @@ int main(int argc, char** argv) {
 
             if (now - last_render >= 0.1) {
                 const double age = state.has_pose ? now - state.last_vrpn_wall_sec : -1.0;
-                live_status.render(opts, state, latest_status, age, latest_vrpn_hz, latest_mqtt_hz);
+                live_status.render(opts, state, latest_vrpn_status, mqtt_status, now - started_at, age, latest_vrpn_hz, latest_mqtt_hz);
                 last_render = now;
             }
 
@@ -827,7 +923,7 @@ int main(int argc, char** argv) {
         }
 
         tracker->unregister_change_handler(&state, &handle_tracker);
-        publish_or_skip(mqtt, opts, opts.status_topic, status_payload(opts, "idle", -1.0), true);
+        publish_or_skip(mqtt, opts, opts.status_topic, status_payload(opts, "idle", -1.0), mqtt_status, true);
     } catch (const std::exception& exc) {
         std::cerr << "error: " << exc.what() << "\n";
         return 1;

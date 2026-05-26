@@ -6,22 +6,20 @@ REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 PREFIX="${HOME}/.local/opt/vrpn-mqtt-bridge"
 CONFIG_FILE="${HOME}/.config/vrpn-mqtt-bridge/vrpn-mqtt-bridge.env"
-ENV_FILE="${REPO_DIR}/examples/native-vrpn.env"
-INSTALL_SYSTEMD=0
-START_SERVICE=0
+ENV_FILE="${REPO_DIR}/examples/default.env"
+INSTALL_DEPS=0
 
 usage() {
   cat <<'USAGE'
 Usage: scripts/deploy-vrpn-mqtt.sh [options]
 
-One-command build + deploy flow for the C++ VRPN-to-MQTT bridge.
+Build and install the C++ VRPN-to-MQTT bridge.
 
 Options:
   --prefix DIR          Install location
   --config-file FILE    Runtime env file
   --env-file FILE       Env template to deploy
-  --install-systemd     Install user-level systemd service
-  --start               Enable and start the user service
+  --install-deps        Install build dependencies with scripts/install-deps.sh
   -h, --help            Show this help
 USAGE
 }
@@ -40,13 +38,8 @@ while [[ $# -gt 0 ]]; do
       ENV_FILE="$2"
       shift 2
       ;;
-    --install-systemd)
-      INSTALL_SYSTEMD=1
-      shift
-      ;;
-    --start)
-      START_SERVICE=1
-      INSTALL_SYSTEMD=1
+    --install-deps)
+      INSTALL_DEPS=1
       shift
       ;;
     -h|--help)
@@ -61,31 +54,38 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ ! -f "${ENV_FILE}" ]]; then
+  echo "env template not found: ${ENV_FILE}" >&2
+  exit 2
+fi
+
+if [[ "${INSTALL_DEPS}" -eq 1 ]]; then
+  "${REPO_DIR}/scripts/install-deps.sh"
+fi
+
 "${REPO_DIR}/scripts/build.sh"
 
-DEPLOY_ARGS=(
-  --bridge-bin "${REPO_DIR}/native/vrpn_mqtt_bridge/build/vrpn-mqtt-bridge"
-  --env-file "${ENV_FILE}"
-  --prefix "${PREFIX}"
-  --config-file "${CONFIG_FILE}"
-)
-
-if [[ "${INSTALL_SYSTEMD}" -eq 1 ]]; then
-  DEPLOY_ARGS+=(--install-systemd)
-fi
-if [[ "${START_SERVICE}" -eq 1 ]]; then
-  DEPLOY_ARGS+=(--start)
-fi
-
-"${REPO_DIR}/scripts/deploy.sh" "${DEPLOY_ARGS[@]}"
-
+BRIDGE_BIN="${REPO_DIR}/native/vrpn_mqtt_bridge/build/vrpn-mqtt-bridge"
 COMMAND_PATH="${PREFIX}/bin/vrpn-mqtt-bridge"
-"${REPO_DIR}/scripts/preflight.sh" --env-file "${CONFIG_FILE}" --command "${COMMAND_PATH}"
+
+if [[ ! -x "${BRIDGE_BIN}" ]]; then
+  echo "bridge binary not found or not executable: ${BRIDGE_BIN}" >&2
+  exit 1
+fi
+
+mkdir -p "$(dirname "${COMMAND_PATH}")" "$(dirname "${CONFIG_FILE}")"
+cp "${BRIDGE_BIN}" "${COMMAND_PATH}"
+chmod +x "${COMMAND_PATH}"
+
+if [[ ! -f "${CONFIG_FILE}" ]]; then
+  cp "${ENV_FILE}" "${CONFIG_FILE}"
+fi
+
+"${COMMAND_PATH}" --env-file "${CONFIG_FILE}" --vrpn-only --quiet --help >/dev/null
 
 cat <<EOF
-
-Deployment complete.
-
-Run manually:
-  ${COMMAND_PATH} --env-file ${CONFIG_FILE}
+Installed VRPN MQTT Bridge
+  command: ${COMMAND_PATH}
+  config: ${CONFIG_FILE}
+  run: ${COMMAND_PATH} --env-file ${CONFIG_FILE}
 EOF

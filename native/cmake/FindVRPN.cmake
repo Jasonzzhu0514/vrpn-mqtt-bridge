@@ -1,36 +1,13 @@
 find_path(VRPN_INCLUDE_DIR
   NAMES vrpn_Tracker.h vrpn_Connection.h
-  PATHS
-    /opt/ros/noetic/include
-    /opt/ros/humble/include
-    /opt/ros/iron/include
-    /opt/ros/jazzy/include
-    /usr/local/include
-    /usr/include
 )
 
 find_library(VRPN_LIBRARY
   NAMES vrpn
-  PATHS
-    /opt/ros/noetic/lib
-    /opt/ros/humble/lib
-    /opt/ros/iron/lib
-    /opt/ros/jazzy/lib
-    /usr/local/lib
-    /usr/lib
-    /usr/lib/x86_64-linux-gnu
 )
 
 find_library(QUAT_LIBRARY
   NAMES quat
-  PATHS
-    /opt/ros/noetic/lib
-    /opt/ros/humble/lib
-    /opt/ros/iron/lib
-    /opt/ros/jazzy/lib
-    /usr/local/lib
-    /usr/lib
-    /usr/lib/x86_64-linux-gnu
 )
 
 include(FindPackageHandleStandardArgs)
