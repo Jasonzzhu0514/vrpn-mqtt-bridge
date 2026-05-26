@@ -88,6 +88,12 @@ Installed VRPN MQTT Bridge
 ./scripts/build.sh
 ```
 
+`scripts/build.sh` 会自动重建带有旧绝对路径的 CMake cache。需要强制清理时：
+
+```bash
+./scripts/build.sh --clean
+```
+
 构建产物：
 
 ```text
@@ -165,7 +171,7 @@ VRPN_ENDPOINT=tracker0@127.0.0.1:3883
 
 ## 状态表
 
-交互式终端会显示一张实时刷新的状态表。表格会按终端宽度自动加长，不会持续刷屏。
+交互式终端会显示一张实时刷新的状态表，表格会按终端宽度自适应。下方 `message:` 行显示断线、重连、MQTT 错误等诊断信息。
 
 ```text
 x====================================================================x
@@ -190,17 +196,19 @@ x====================================================================x
 |     DATA     |        z         |              7.89012             |
 |     DATA     |       yaw        |              45.12345            |
 x====================================================================x
+message: VRPN connected to tracker0@127.0.0.1:3883
 ```
 
 | 项 | 含义 |
 | --- | --- |
 | `mode` | `normal` 表示读取 VRPN 并发布 MQTT；`vrpn-only` 表示只读取 VRPN。 |
-| `VRPN/status` | `waiting`、`running` 或 `stalled`。 |
+| `VRPN/status` | `waiting`、`running`、`stalled`、`no-response` 或 `reconnecting`。 |
 | `VRPN/lag` | 距离最后一帧 VRPN pose 的时间，单位秒。 |
 | `VRPN/rec_hz` | VRPN pose 接收频率。 |
 | `MQTT/status` | `init`、`ok`、`error` 或 `disabled`。 |
 | `MQTT/pub_hz` | 成功发布 pose 的频率。 |
 | `DATA/x/y/z/yaw` | 最新位姿数据，保留 5 位小数。 |
+| `message` | 固定在表格下方的一行诊断信息。默认抑制 VRPN 底层重复错误；需要原始 stderr 时使用 `--show-vrpn-errors` 或 `VRPN_SHOW_ERRORS=true`。 |
 
 ## MQTT Payload
 
@@ -239,6 +247,8 @@ x====================================================================x
 | 现象 | 检查 |
 | --- | --- |
 | `VRPN/status=waiting` | tracker 名称、VRPN host/port、VRPN server 是否运行。 |
+| `VRPN/status=no-response` | 已超过等待阈值仍未收到首帧数据，检查 tracker 名称和 VRPN server。 |
 | `VRPN/status=stalled` | VRPN server 是否仍在发布数据。 |
+| `VRPN/status=reconnecting` | 网络断开或连接异常，程序正在按间隔重建 VRPN 连接。 |
 | `MQTT/status=error` | MQTT host/port、用户名、密码、broker 是否可连接。 |
 | 只想验证 VRPN | 使用 `--vrpn-only`。 |

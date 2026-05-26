@@ -1,3 +1,4 @@
+#include <fcntl.h>
 #include <netdb.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
@@ -31,9 +32,10 @@ namespace {
 std::atomic<bool> g_should_exit{false};
 
 constexpr double kDefaultMaxMqttRateHz = 10.0;
+constexpr double kNoResponseWarningSec = 3.0;
+constexpr double kVrpnReconnectIntervalSec = 2.0;
 constexpr int kPosePrecision = 5;
 constexpr int kMetricPrecision = 3;
-constexpr std::size_t kMinPanelWidth = 70;
 constexpr std::size_t kGroupColumnWidth = 12;
 constexpr std::size_t kItemColumnWidth = 16;
 
@@ -61,6 +63,7 @@ struct Options {
     bool invert_yaw = false;
     bool vrpn_only = false;
     bool quiet = false;
+    bool suppress_vrpn_errors = true;
 };
 
 struct Pose {
@@ -81,9 +84,59 @@ struct RuntimeState {
     std::uint64_t vrpn_count = 0;
 };
 
+struct VrpnSnapshot {
+    double age_sec = -1.0;
+    bool should_reconnect = false;
+    std::string status = "waiting";
+};
+
 void handle_signal(int) {
     g_should_exit.store(true);
 }
+
+class ScopedStderrSilencer {
+   public:
+    explicit ScopedStderrSilencer(bool enabled) {
+        if (!enabled) {
+            return;
+        }
+        std::fflush(stderr);
+        saved_fd_ = dup(STDERR_FILENO);
+        if (saved_fd_ < 0) {
+            return;
+        }
+        null_fd_ = open("/dev/null", O_WRONLY);
+        if (null_fd_ < 0) {
+            ::close(saved_fd_);
+            saved_fd_ = -1;
+            return;
+        }
+        if (dup2(null_fd_, STDERR_FILENO) < 0) {
+            ::close(saved_fd_);
+            ::close(null_fd_);
+            saved_fd_ = -1;
+            null_fd_ = -1;
+        }
+    }
+
+    ~ScopedStderrSilencer() {
+        if (saved_fd_ >= 0) {
+            std::fflush(stderr);
+            dup2(saved_fd_, STDERR_FILENO);
+            ::close(saved_fd_);
+        }
+        if (null_fd_ >= 0) {
+            ::close(null_fd_);
+        }
+    }
+
+    ScopedStderrSilencer(const ScopedStderrSilencer&) = delete;
+    ScopedStderrSilencer& operator=(const ScopedStderrSilencer&) = delete;
+
+   private:
+    int saved_fd_ = -1;
+    int null_fd_ = -1;
+};
 
 double now_sec() {
     using clock = std::chrono::steady_clock;
@@ -153,6 +206,7 @@ void print_usage(const char* exe) {
         << "  --invert-yaw              Invert yaw sign\n"
         << "  --vrpn-only               Read VRPN without connecting to MQTT\n"
         << "  --quiet                   Suppress terminal status display\n"
+        << "  --show-vrpn-errors        Print raw VRPN stderr messages\n"
         << "  --sample-ms MS            VRPN poll sleep in milliseconds (default 2)\n"
         << "  -h, --help                Show this help\n";
 }
@@ -245,6 +299,7 @@ void apply_config(Options& opts, const std::string& key, const std::string& valu
     else if (key == "VRPN_INVERT_YAW") opts.invert_yaw = env_bool(value, opts.invert_yaw);
     else if (key == "VRPN_ONLY") opts.vrpn_only = env_bool(value, opts.vrpn_only);
     else if (key == "VRPN_QUIET") opts.quiet = env_bool(value, opts.quiet);
+    else if (key == "VRPN_SHOW_ERRORS") opts.suppress_vrpn_errors = !env_bool(value, !opts.suppress_vrpn_errors);
     else if (key == "VRPN_SAMPLE_MS") opts.sample_ms = std::atoi(value.c_str());
 }
 
@@ -345,6 +400,8 @@ Options parse_args(int argc, char** argv) {
             opts.vrpn_only = true;
         } else if (arg == "--quiet") {
             opts.quiet = true;
+        } else if (arg == "--show-vrpn-errors") {
+            opts.suppress_vrpn_errors = false;
         } else if (arg == "--sample-ms") {
             if (!needs_value(i, argc, "--sample-ms")) std::exit(2);
             opts.sample_ms = std::atoi(argv[++i]);
@@ -642,18 +699,22 @@ std::string center_cell(const std::string& value, std::size_t width) {
 
 std::size_t terminal_columns() {
     struct winsize size {};
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &size) == 0 && size.ws_col > 20) {
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &size) == 0 && size.ws_col > 0) {
         return static_cast<std::size_t>(size.ws_col);
     }
     return 80;
 }
 
-std::string trim_to_terminal(std::string line) {
+std::size_t terminal_text_width() {
     const std::size_t columns = terminal_columns();
-    if (columns <= 1) {
+    return columns > 2 ? columns - 2 : columns;
+}
+
+std::string trim_to_terminal(std::string line) {
+    const std::size_t max_width = terminal_text_width();
+    if (max_width == 0) {
         return "";
     }
-    const std::size_t max_width = columns - 1;
     if (line.size() > max_width) {
         line.resize(max_width);
     }
@@ -661,11 +722,7 @@ std::string trim_to_terminal(std::string line) {
 }
 
 std::size_t panel_width() {
-    const std::size_t columns = terminal_columns();
-    if (columns <= kMinPanelWidth + 1) {
-        return kMinPanelWidth;
-    }
-    return columns - 1;
+    return std::max<std::size_t>(terminal_text_width(), 2);
 }
 
 std::size_t value_column_width(std::size_t width) {
@@ -718,6 +775,62 @@ std::string mode_text(const Options& opts) {
     return opts.vrpn_only ? "vrpn-only" : "normal";
 }
 
+double pose_age_sec(const RuntimeState& state, double now) {
+    return state.has_pose ? now - state.last_vrpn_wall_sec : -1.0;
+}
+
+VrpnSnapshot vrpn_snapshot(const RuntimeState& state,
+                           double now,
+                           double started_at,
+                           double timeout_sec,
+                           bool connection_broken,
+                           bool connection_connected) {
+    VrpnSnapshot snapshot;
+    snapshot.age_sec = pose_age_sec(state, now);
+    const bool no_response = !state.has_pose &&
+                             now - started_at >= std::min(timeout_sec, kNoResponseWarningSec);
+    const bool pose_stalled = state.has_pose && snapshot.age_sec > timeout_sec;
+    const bool connection_lost_after_pose = state.has_pose && !connection_connected;
+    snapshot.should_reconnect = connection_broken ||
+                                pose_stalled ||
+                                (!connection_connected && no_response) ||
+                                connection_lost_after_pose;
+    if (snapshot.should_reconnect || (!connection_connected && (no_response || state.has_pose))) {
+        snapshot.status = "reconnecting";
+    } else if (!state.has_pose) {
+        snapshot.status = no_response ? "no-response" : "waiting";
+    } else {
+        snapshot.status = pose_stalled ? "stalled" : "running";
+    }
+    return snapshot;
+}
+
+std::string live_message_text(const Options& opts,
+                              const VrpnSnapshot& vrpn,
+                              const std::string& mqtt_status,
+                              std::uint64_t reconnect_attempts) {
+    if (vrpn.status == "reconnecting") {
+        return "message: VRPN reconnecting to " + opts.endpoint + " every " +
+               format_decimal(kVrpnReconnectIntervalSec, 1) + "s, attempt " +
+               std::to_string(reconnect_attempts);
+    }
+    if (vrpn.status == "stalled") {
+        return "message: VRPN pose stalled for " + format_decimal(vrpn.age_sec, 1) +
+               "s; keeping last pose while reconnecting";
+    }
+    if (vrpn.status == "no-response") {
+        return "message: no VRPN pose from " + opts.endpoint +
+               "; check tracker name, host, port, and server";
+    }
+    if (vrpn.status == "waiting") {
+        return "message: waiting for VRPN pose from " + opts.endpoint;
+    }
+    if (mqtt_status == "error") {
+        return "message: MQTT publish failed; check broker host, port, username, and password";
+    }
+    return "message: VRPN connected to " + opts.endpoint;
+}
+
 std::vector<std::string> live_status_table(const Options& opts,
                                            const RuntimeState& state,
                                            const std::string& vrpn_status,
@@ -767,24 +880,21 @@ class LiveStatus {
                 double duration_sec,
                 double age_sec,
                 double vrpn_hz,
-                double mqtt_hz) {
+                double mqtt_hz,
+                const std::string& message) {
         if (!enabled_) {
             return;
         }
         const auto lines = live_status_table(opts, state, vrpn_status, mqtt_status, duration_sec, age_sec, vrpn_hz, mqtt_hz);
-        if (printed_ && line_count_ > 0) {
-            std::cout << "\033[" << line_count_ << "A";
-        } else {
-            printed_ = true;
-        }
-        line_count_ = lines.size();
+        std::cout << (printed_ ? "\033[H" : "\033[H\033[2J");
         for (std::size_t i = 0; i < lines.size(); ++i) {
-            std::cout << "\r\033[2K" << trim_to_terminal(lines[i]);
+            std::cout << "\033[2K" << trim_to_terminal(lines[i]);
             if (i + 1 < lines.size()) {
                 std::cout << "\n";
             }
         }
-        std::cout << "\n" << std::flush;
+        printed_ = true;
+        std::cout << "\n\033[2K" << trim_to_terminal(message) << "\033[J\n" << std::flush;
     }
 
     void finish() {
@@ -797,7 +907,6 @@ class LiveStatus {
    private:
     bool enabled_ = false;
     bool printed_ = false;
-    std::size_t line_count_ = 0;
 };
 
 void print_startup_config(const Options& opts) {
@@ -862,10 +971,41 @@ int main(int argc, char** argv) {
         std::string mqtt_status = opts.vrpn_only ? "disabled" : "init";
 
         LiveStatus live_status(opts);
-        live_status.render(opts, state, "waiting", mqtt_status, 0.0, -1.0, 0.0, 0.0);
+        const VrpnSnapshot initial_vrpn;
+        live_status.render(opts,
+                           state,
+                           initial_vrpn.status,
+                           mqtt_status,
+                           0.0,
+                           initial_vrpn.age_sec,
+                           0.0,
+                           0.0,
+                           live_message_text(opts, initial_vrpn, mqtt_status, 0));
 
-        std::unique_ptr<vrpn_Tracker_Remote> tracker(new vrpn_Tracker_Remote(opts.endpoint.c_str()));
-        tracker->register_change_handler(&state, &handle_tracker);
+        std::unique_ptr<vrpn_Tracker_Remote> tracker;
+        std::uint64_t reconnect_attempts = 0;
+        double last_reconnect_at = 0.0;
+
+        auto close_tracker = [&]() {
+            if (!tracker) {
+                return;
+            }
+            ScopedStderrSilencer silence(opts.suppress_vrpn_errors);
+            tracker->unregister_change_handler(&state, &handle_tracker);
+            tracker.reset();
+        };
+
+        auto reconnect_tracker = [&](double now) {
+            close_tracker();
+            ScopedStderrSilencer silence(opts.suppress_vrpn_errors);
+            tracker = std::make_unique<vrpn_Tracker_Remote>(opts.endpoint.c_str());
+            tracker->shutup = true;
+            tracker->register_change_handler(&state, &handle_tracker);
+            reconnect_attempts += 1;
+            last_reconnect_at = now;
+        };
+
+        reconnect_tracker(started_at);
 
         double last_publish = 0.0;
         double last_status = 0.0;
@@ -873,33 +1013,52 @@ int main(int argc, char** argv) {
         double stat_at = now_sec();
         double latest_vrpn_hz = 0.0;
         double latest_mqtt_hz = 0.0;
-        std::string latest_vrpn_status = "waiting";
         std::uint64_t vrpn_count_at_stat = 0;
         std::uint64_t mqtt_count_at_stat = 0;
         std::uint64_t mqtt_count = 0;
+        std::uint64_t last_published_vrpn_count = 0;
 
         while (!g_should_exit.load()) {
-            tracker->mainloop();
-            if (auto* connection = tracker->connectionPtr()) {
-                connection->mainloop();
+            bool connection_broken = !tracker;
+            bool connection_connected = false;
+            if (tracker) {
+                {
+                    ScopedStderrSilencer silence(opts.suppress_vrpn_errors);
+                    tracker->mainloop();
+                }
+                if (auto* connection = tracker->connectionPtr()) {
+                    connection_broken = !connection->doing_okay();
+                    connection_connected = connection->connected();
+                } else {
+                    connection_broken = true;
+                }
             }
 
             const double now = now_sec();
-            if (state.has_pose && now - last_publish >= 1.0 / opts.max_mqtt_rate_hz) {
+            VrpnSnapshot vrpn = vrpn_snapshot(state,
+                                              now,
+                                              started_at,
+                                              opts.timeout_sec,
+                                              connection_broken,
+                                              connection_connected);
+            if (vrpn.should_reconnect && now - last_reconnect_at >= kVrpnReconnectIntervalSec) {
+                reconnect_tracker(now);
+            }
+
+            if (state.has_pose &&
+                state.vrpn_count != last_published_vrpn_count &&
+                now - last_publish >= 1.0 / opts.max_mqtt_rate_hz) {
                 const bool pose_ok = publish_or_skip(mqtt, opts, opts.pose_topic, pose_payload(opts, state.latest_pose), mqtt_status);
                 const bool yaw_ok = publish_or_skip(mqtt, opts, opts.yaw_topic, yaw_payload(opts, state.latest_pose), mqtt_status);
                 if (pose_ok && yaw_ok) {
                     mqtt_count += 1;
                 }
+                last_published_vrpn_count = state.vrpn_count;
                 last_publish = now;
             }
 
             if (now - last_status >= opts.status_interval_sec) {
-                const double age = state.has_pose ? now - state.last_vrpn_wall_sec : -1.0;
-                latest_vrpn_status = "waiting";
-                if (state.has_pose && age <= opts.timeout_sec) latest_vrpn_status = "running";
-                if (state.has_pose && age > opts.timeout_sec) latest_vrpn_status = "stalled";
-                publish_or_skip(mqtt, opts, opts.status_topic, status_payload(opts, latest_vrpn_status, age), mqtt_status, true);
+                publish_or_skip(mqtt, opts, opts.status_topic, status_payload(opts, vrpn.status, vrpn.age_sec), mqtt_status, true);
 
                 const double dt = now - stat_at;
                 if (dt > 0) {
@@ -914,15 +1073,22 @@ int main(int argc, char** argv) {
             }
 
             if (now - last_render >= 0.1) {
-                const double age = state.has_pose ? now - state.last_vrpn_wall_sec : -1.0;
-                live_status.render(opts, state, latest_vrpn_status, mqtt_status, now - started_at, age, latest_vrpn_hz, latest_mqtt_hz);
+                live_status.render(opts,
+                                   state,
+                                   vrpn.status,
+                                   mqtt_status,
+                                   now - started_at,
+                                   vrpn.age_sec,
+                                   latest_vrpn_hz,
+                                   latest_mqtt_hz,
+                                   live_message_text(opts, vrpn, mqtt_status, reconnect_attempts));
                 last_render = now;
             }
 
             std::this_thread::sleep_for(std::chrono::milliseconds(opts.sample_ms));
         }
 
-        tracker->unregister_change_handler(&state, &handle_tracker);
+        close_tracker();
         publish_or_skip(mqtt, opts, opts.status_topic, status_payload(opts, "idle", -1.0), mqtt_status, true);
     } catch (const std::exception& exc) {
         std::cerr << "error: " << exc.what() << "\n";
