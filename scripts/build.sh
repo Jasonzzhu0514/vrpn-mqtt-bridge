@@ -27,14 +27,49 @@ remove_build_dir() {
   rm -rf "${BUILD_DIR}"
 }
 
+require_value() {
+  local option="$1"
+  local value="${2-}"
+  if [[ -z "${value}" || "${value}" == -* ]]; then
+    echo "${option} requires a value" >&2
+    usage >&2
+    exit 2
+  fi
+}
+
+normalize_abs_path() {
+  local path="$1"
+  local part keep
+  local -a parts normalized
+
+  IFS='/' read -r -a parts <<<"${path}"
+  for part in "${parts[@]}"; do
+    case "${part}" in
+      ""|".")
+        ;;
+      "..")
+        if [[ "${#normalized[@]}" -gt 0 ]]; then
+          keep=$((${#normalized[@]} - 1))
+          normalized=("${normalized[@]:0:${keep}}")
+        fi
+        ;;
+      *)
+        normalized+=("${part}")
+        ;;
+    esac
+  done
+
+  if [[ "${#normalized[@]}" -eq 0 ]]; then
+    printf '/'
+  else
+    printf '/%s' "${normalized[@]}"
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --build-dir)
-      if [[ $# -lt 2 ]]; then
-        echo "--build-dir requires a value" >&2
-        usage >&2
-        exit 2
-      fi
+      require_value "$1" "${2-}"
       BUILD_DIR="$2"
       shift 2
       ;;
@@ -58,11 +93,7 @@ if [[ "${BUILD_DIR}" != /* ]]; then
   BUILD_DIR="${REPO_DIR}/${BUILD_DIR}"
 fi
 
-if command -v realpath >/dev/null 2>&1; then
-  BUILD_DIR="$(realpath -m "${BUILD_DIR}")"
-else
-  BUILD_DIR="$(cd "$(dirname "${BUILD_DIR}")" && pwd -P)/$(basename "${BUILD_DIR}")"
-fi
+BUILD_DIR="$(normalize_abs_path "${BUILD_DIR}")"
 
 if [[ -z "${BUILD_DIR}" || "${BUILD_DIR}" == "/" || "${BUILD_DIR}" == "${REPO_DIR}" || "${BUILD_DIR}" == "${SOURCE_DIR}" ]]; then
   echo "refusing unsafe build directory: ${BUILD_DIR}" >&2

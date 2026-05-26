@@ -24,17 +24,30 @@ Options:
 USAGE
 }
 
+require_value() {
+  local option="$1"
+  local value="${2-}"
+  if [[ -z "${value}" || "${value}" == -* ]]; then
+    echo "${option} requires a value" >&2
+    usage >&2
+    exit 2
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --prefix)
+      require_value "$1" "${2-}"
       PREFIX="$2"
       shift 2
       ;;
     --config-file)
+      require_value "$1" "${2-}"
       CONFIG_FILE="$2"
       shift 2
       ;;
     --env-file)
+      require_value "$1" "${2-}"
       ENV_FILE="$2"
       shift 2
       ;;
