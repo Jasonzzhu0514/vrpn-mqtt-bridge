@@ -19,6 +19,7 @@
 #include <cctype>
 #include <ctime>
 #include <iomanip>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -94,14 +95,14 @@ void handle_signal(int) {
     g_should_exit.store(true);
 }
 
-class ScopedStderrSilencer {
+class ScopedFdSilencer {
    public:
-    explicit ScopedStderrSilencer(bool enabled) {
+    ScopedFdSilencer(int target_fd, bool enabled) : target_fd_(target_fd) {
         if (!enabled) {
             return;
         }
-        std::fflush(stderr);
-        saved_fd_ = dup(STDERR_FILENO);
+        flush_target();
+        saved_fd_ = dup(target_fd_);
         if (saved_fd_ < 0) {
             return;
         }
@@ -111,7 +112,7 @@ class ScopedStderrSilencer {
             saved_fd_ = -1;
             return;
         }
-        if (dup2(null_fd_, STDERR_FILENO) < 0) {
+        if (dup2(null_fd_, target_fd_) < 0) {
             ::close(saved_fd_);
             ::close(null_fd_);
             saved_fd_ = -1;
@@ -119,10 +120,10 @@ class ScopedStderrSilencer {
         }
     }
 
-    ~ScopedStderrSilencer() {
+    ~ScopedFdSilencer() {
         if (saved_fd_ >= 0) {
-            std::fflush(stderr);
-            dup2(saved_fd_, STDERR_FILENO);
+            flush_target();
+            dup2(saved_fd_, target_fd_);
             ::close(saved_fd_);
         }
         if (null_fd_ >= 0) {
@@ -130,10 +131,23 @@ class ScopedStderrSilencer {
         }
     }
 
-    ScopedStderrSilencer(const ScopedStderrSilencer&) = delete;
-    ScopedStderrSilencer& operator=(const ScopedStderrSilencer&) = delete;
+    bool active() const {
+        return saved_fd_ >= 0;
+    }
+
+    ScopedFdSilencer(const ScopedFdSilencer&) = delete;
+    ScopedFdSilencer& operator=(const ScopedFdSilencer&) = delete;
 
    private:
+    void flush_target() const {
+        if (target_fd_ == STDOUT_FILENO) {
+            std::fflush(stdout);
+        } else if (target_fd_ == STDERR_FILENO) {
+            std::fflush(stderr);
+        }
+    }
+
+    int target_fd_ = -1;
     int saved_fd_ = -1;
     int null_fd_ = -1;
 };
@@ -702,6 +716,17 @@ std::size_t terminal_columns() {
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &size) == 0 && size.ws_col > 0) {
         return static_cast<std::size_t>(size.ws_col);
     }
+    if (ioctl(STDERR_FILENO, TIOCGWINSZ, &size) == 0 && size.ws_col > 0) {
+        return static_cast<std::size_t>(size.ws_col);
+    }
+    const int tty_fd = open("/dev/tty", O_RDONLY);
+    if (tty_fd >= 0) {
+        const bool ok = ioctl(tty_fd, TIOCGWINSZ, &size) == 0 && size.ws_col > 0;
+        ::close(tty_fd);
+        if (ok) {
+            return static_cast<std::size_t>(size.ws_col);
+        }
+    }
     return 80;
 }
 
@@ -781,21 +806,29 @@ double pose_age_sec(const RuntimeState& state, double now) {
 
 VrpnSnapshot vrpn_snapshot(const RuntimeState& state,
                            double now,
-                           double started_at,
+                           double wait_started_at,
                            double timeout_sec,
                            bool connection_broken,
-                           bool connection_connected) {
+                           bool connection_connected,
+                           bool awaiting_recovery_pose) {
     VrpnSnapshot snapshot;
     snapshot.age_sec = pose_age_sec(state, now);
+    const double wait_age_sec = now - wait_started_at;
     const bool no_response = !state.has_pose &&
-                             now - started_at >= std::min(timeout_sec, kNoResponseWarningSec);
-    const bool pose_stalled = state.has_pose && snapshot.age_sec > timeout_sec;
-    const bool connection_lost_after_pose = state.has_pose && !connection_connected;
-    snapshot.should_reconnect = connection_broken ||
+                             wait_age_sec >= std::min(timeout_sec, kNoResponseWarningSec);
+    const bool recovery_timeout = awaiting_recovery_pose && wait_age_sec >= timeout_sec;
+    const bool pose_stalled = state.has_pose && !awaiting_recovery_pose && snapshot.age_sec > timeout_sec;
+    const bool connection_lost_after_pose = state.has_pose && !awaiting_recovery_pose && !connection_connected;
+    const bool connection_failed_after_grace = connection_broken &&
+                                               (!awaiting_recovery_pose ||
+                                                wait_age_sec >= kVrpnReconnectIntervalSec);
+    snapshot.should_reconnect = connection_failed_after_grace ||
                                 pose_stalled ||
                                 (!connection_connected && no_response) ||
-                                connection_lost_after_pose;
-    if (snapshot.should_reconnect || (!connection_connected && (no_response || state.has_pose))) {
+                                connection_lost_after_pose ||
+                                recovery_timeout;
+    if (snapshot.should_reconnect || awaiting_recovery_pose ||
+        (!connection_connected && (no_response || state.has_pose))) {
         snapshot.status = "reconnecting";
     } else if (!state.has_pose) {
         snapshot.status = no_response ? "no-response" : "waiting";
@@ -867,7 +900,9 @@ std::vector<std::string> live_status_table(const Options& opts,
 
 class LiveStatus {
    public:
-    explicit LiveStatus(const Options& opts) : enabled_(!opts.quiet && isatty(STDOUT_FILENO)) {}
+    explicit LiveStatus(const Options& opts)
+        : tty_("/dev/tty", std::ios::out),
+          enabled_(!opts.quiet && tty_.is_open()) {}
 
     ~LiveStatus() {
         finish();
@@ -886,25 +921,31 @@ class LiveStatus {
             return;
         }
         const auto lines = live_status_table(opts, state, vrpn_status, mqtt_status, duration_sec, age_sec, vrpn_hz, mqtt_hz);
-        std::cout << (printed_ ? "\033[H" : "\033[H\033[2J");
+        if (!printed_) {
+            tty_ << "\033[?25l\033[2J";
+        }
+        tty_ << "\033[1;1H";
         for (std::size_t i = 0; i < lines.size(); ++i) {
-            std::cout << "\033[2K" << trim_to_terminal(lines[i]);
-            if (i + 1 < lines.size()) {
-                std::cout << "\n";
-            }
+            tty_ << "\033[2K" << trim_to_terminal(lines[i]);
+            tty_ << "\r\n";
         }
         printed_ = true;
-        std::cout << "\n\033[2K" << trim_to_terminal(message) << "\033[J\n" << std::flush;
+        tty_ << "\033[2K" << trim_to_terminal(message) << "\r\n\033[J" << std::flush;
     }
 
     void finish() {
         if (enabled_ && printed_) {
-            std::cout << "\n";
+            tty_ << "\033[?25h\n" << std::flush;
             printed_ = false;
         }
     }
 
+    bool enabled() const {
+        return enabled_;
+    }
+
    private:
+    std::ofstream tty_;
     bool enabled_ = false;
     bool printed_ = false;
 };
@@ -971,6 +1012,21 @@ int main(int argc, char** argv) {
         std::string mqtt_status = opts.vrpn_only ? "disabled" : "init";
 
         LiveStatus live_status(opts);
+        std::unique_ptr<ScopedFdSilencer> runtime_stdout_silence;
+        std::unique_ptr<ScopedFdSilencer> runtime_stderr_silence;
+        if (opts.suppress_vrpn_errors && live_status.enabled()) {
+            runtime_stdout_silence = std::make_unique<ScopedFdSilencer>(STDOUT_FILENO, true);
+            if (!runtime_stdout_silence->active()) {
+                runtime_stdout_silence.reset();
+            }
+            runtime_stderr_silence = std::make_unique<ScopedFdSilencer>(STDERR_FILENO, true);
+            if (!runtime_stderr_silence->active()) {
+                runtime_stderr_silence.reset();
+            }
+        }
+        const bool scoped_stdout_silence = opts.suppress_vrpn_errors && !runtime_stdout_silence;
+        const bool scoped_stderr_silence = opts.suppress_vrpn_errors && !runtime_stderr_silence;
+
         const VrpnSnapshot initial_vrpn;
         live_status.render(opts,
                            state,
@@ -985,27 +1041,35 @@ int main(int argc, char** argv) {
         std::unique_ptr<vrpn_Tracker_Remote> tracker;
         std::uint64_t reconnect_attempts = 0;
         double last_reconnect_at = 0.0;
+        std::uint64_t vrpn_count_at_reconnect = 0;
+        double vrpn_wait_started_at = started_at;
+        bool recovering_vrpn = false;
 
         auto close_tracker = [&]() {
             if (!tracker) {
                 return;
             }
-            ScopedStderrSilencer silence(opts.suppress_vrpn_errors);
+            ScopedFdSilencer stdout_silence(STDOUT_FILENO, scoped_stdout_silence);
+            ScopedFdSilencer stderr_silence(STDERR_FILENO, scoped_stderr_silence);
             tracker->unregister_change_handler(&state, &handle_tracker);
             tracker.reset();
         };
 
-        auto reconnect_tracker = [&](double now) {
+        auto reconnect_tracker = [&](double now, bool recovery) {
             close_tracker();
-            ScopedStderrSilencer silence(opts.suppress_vrpn_errors);
+            ScopedFdSilencer stdout_silence(STDOUT_FILENO, scoped_stdout_silence);
+            ScopedFdSilencer stderr_silence(STDERR_FILENO, scoped_stderr_silence);
             tracker = std::make_unique<vrpn_Tracker_Remote>(opts.endpoint.c_str());
             tracker->shutup = true;
             tracker->register_change_handler(&state, &handle_tracker);
             reconnect_attempts += 1;
             last_reconnect_at = now;
+            vrpn_count_at_reconnect = state.vrpn_count;
+            vrpn_wait_started_at = now;
+            recovering_vrpn = recovery;
         };
 
-        reconnect_tracker(started_at);
+        reconnect_tracker(started_at, false);
 
         double last_publish = 0.0;
         double last_status = 0.0;
@@ -1023,7 +1087,8 @@ int main(int argc, char** argv) {
             bool connection_connected = false;
             if (tracker) {
                 {
-                    ScopedStderrSilencer silence(opts.suppress_vrpn_errors);
+                    ScopedFdSilencer stdout_silence(STDOUT_FILENO, scoped_stdout_silence);
+                    ScopedFdSilencer stderr_silence(STDERR_FILENO, scoped_stderr_silence);
                     tracker->mainloop();
                 }
                 if (auto* connection = tracker->connectionPtr()) {
@@ -1035,14 +1100,23 @@ int main(int argc, char** argv) {
             }
 
             const double now = now_sec();
+            if (state.vrpn_count > vrpn_count_at_reconnect) {
+                recovering_vrpn = false;
+            }
+            const bool awaiting_recovery_pose = recovering_vrpn &&
+                                                state.vrpn_count <= vrpn_count_at_reconnect;
             VrpnSnapshot vrpn = vrpn_snapshot(state,
                                               now,
-                                              started_at,
+                                              vrpn_wait_started_at,
                                               opts.timeout_sec,
                                               connection_broken,
-                                              connection_connected);
+                                              connection_connected,
+                                              awaiting_recovery_pose);
+            if (vrpn.should_reconnect) {
+                recovering_vrpn = true;
+            }
             if (vrpn.should_reconnect && now - last_reconnect_at >= kVrpnReconnectIntervalSec) {
-                reconnect_tracker(now);
+                reconnect_tracker(now, true);
             }
 
             if (state.has_pose &&
