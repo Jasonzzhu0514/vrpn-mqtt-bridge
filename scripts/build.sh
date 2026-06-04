@@ -6,6 +6,8 @@ REPO_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SOURCE_DIR="${REPO_DIR}/native/vrpn_mqtt_bridge"
 BUILD_DIR="${REPO_DIR}/native/vrpn_mqtt_bridge/build"
 CLEAN=0
+AUTO_INSTALL_DEPS=1
+declare -a EXTRA_CMAKE_ARGS=()
 
 usage() {
   cat <<'USAGE'
@@ -15,11 +17,16 @@ Build the C++ VRPN-to-MQTT bridge.
 
 Options:
   --build-dir DIR   CMake build directory (default: native/vrpn_mqtt_bridge/build)
+  --cmake-arg ARG   Extra argument passed to cmake configure; can be repeated
   --clean           Remove the build directory before configuring
+  --no-install-deps Do not auto-install missing cmake/VRPN dependencies
   -h, --help        Show this help
 
 Environment:
+  AUTO_INSTALL_DEPS Set to false/0/no to disable dependency auto-install
   BUILD_JOBS        Parallel build jobs (default: 2)
+  CMAKE_ARGS        Extra cmake configure arguments, split by shell words
+  VRPN_ROOT         VRPN install prefix used by native/cmake/FindVRPN.cmake
 USAGE
 }
 
@@ -73,8 +80,17 @@ while [[ $# -gt 0 ]]; do
       BUILD_DIR="$2"
       shift 2
       ;;
+    --cmake-arg)
+      require_value "$1" "${2-}"
+      EXTRA_CMAKE_ARGS+=("$2")
+      shift 2
+      ;;
     --clean)
       CLEAN=1
+      shift
+      ;;
+    --no-install-deps)
+      AUTO_INSTALL_DEPS=0
       shift
       ;;
     -h|--help)
@@ -89,6 +105,15 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+case "${AUTO_INSTALL_DEPS:-1}" in
+  0|false|FALSE|no|NO)
+    AUTO_INSTALL_DEPS=0
+    ;;
+  *)
+    AUTO_INSTALL_DEPS=1
+    ;;
+esac
+
 if [[ "${BUILD_DIR}" != /* ]]; then
   BUILD_DIR="${REPO_DIR}/${BUILD_DIR}"
 fi
@@ -101,8 +126,13 @@ if [[ -z "${BUILD_DIR}" || "${BUILD_DIR}" == "/" || "${BUILD_DIR}" == "${REPO_DI
 fi
 
 if ! command -v cmake >/dev/null 2>&1; then
-  echo "cmake not found" >&2
-  exit 1
+  if [[ "${AUTO_INSTALL_DEPS}" -eq 1 ]]; then
+    "${REPO_DIR}/scripts/install-deps.sh"
+  fi
+  if ! command -v cmake >/dev/null 2>&1; then
+    echo "cmake not found; install cmake or rerun with dependency auto-install enabled" >&2
+    exit 1
+  fi
 fi
 
 if [[ "${CLEAN}" -eq 1 ]]; then
@@ -117,7 +147,36 @@ elif [[ -f "${BUILD_DIR}/CMakeCache.txt" ]]; then
   fi
 fi
 
-cmake -S "${SOURCE_DIR}" -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE=Release
+if [[ -n "${CMAKE_ARGS:-}" ]]; then
+  read -r -a env_cmake_args <<<"${CMAKE_ARGS}"
+  EXTRA_CMAKE_ARGS+=("${env_cmake_args[@]}")
+fi
+
+mkdir -p "${BUILD_DIR}"
+CONFIGURE_LOG="${BUILD_DIR}/cmake-configure.log"
+
+configure() {
+  cmake -S "${SOURCE_DIR}" -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE=Release "${EXTRA_CMAKE_ARGS[@]}" 2>&1 | tee "${CONFIGURE_LOG}"
+}
+
+configure_failed_for_dependencies() {
+  grep -Eqi 'Could NOT find VRPN|FindVRPN|VRPN.*not found|vrpn_Tracker\.h|libvrpn|libquat|CMAKE_CXX_COMPILER|No CMAKE_CXX_COMPILER|CXX compiler' "${CONFIGURE_LOG}"
+}
+
+if ! configure; then
+  if [[ "${AUTO_INSTALL_DEPS}" -ne 1 ]]; then
+    echo "cmake configure failed; install missing dependencies or rerun without --no-install-deps" >&2
+    exit 1
+  fi
+  if ! configure_failed_for_dependencies; then
+    echo "cmake configure failed for a reason that does not look like missing dependencies; not running auto-install" >&2
+    exit 1
+  fi
+  echo "cmake configure failed; installing build dependencies and retrying..."
+  "${REPO_DIR}/scripts/install-deps.sh"
+  configure
+fi
+
 cmake --build "${BUILD_DIR}" --parallel "${BUILD_JOBS:-2}"
 
 echo "Built:"

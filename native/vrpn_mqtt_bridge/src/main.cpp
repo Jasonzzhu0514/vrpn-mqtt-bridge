@@ -7,6 +7,10 @@
 #include <vrpn_Connection.h>
 #include <vrpn_Tracker.h>
 
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -1000,6 +1004,9 @@ void VRPN_CALLBACK handle_tracker(void* userdata, const vrpn_TRACKERCB info) {
 int main(int argc, char** argv) {
     std::signal(SIGINT, handle_signal);
     std::signal(SIGTERM, handle_signal);
+#ifdef SIGPIPE
+    std::signal(SIGPIPE, SIG_IGN);
+#endif
 
     try {
         Options opts = parse_args(argc, argv);

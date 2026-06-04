@@ -27,19 +27,16 @@ libvrpn
 libquat
 ```
 
-Ubuntu/Debian 可以直接安装构建依赖：
+直接构建。脚本会在支持的平台自动安装缺失的构建依赖：
 
 ```bash
-./scripts/install-deps.sh
+./scripts/build.sh
 ```
 
-`native/cmake/FindVRPN.cmake` 只查找本机已有 VRPN headers/libs，不下载、不编译 VRPN。VRPN 安装在非标准路径时，可以手动指定：
+`native/cmake/FindVRPN.cmake` 只查找本机已有 VRPN headers/libs，不下载、不编译 VRPN。VRPN 安装在特殊路径时，可以用 `VRPN_ROOT` 指定：
 
 ```bash
-cmake -S native/vrpn_mqtt_bridge -B native/vrpn_mqtt_bridge/build \
-  -DVRPN_INCLUDE_DIR=/path/to/include \
-  -DVRPN_LIBRARY=/path/to/libvrpn.so \
-  -DQUAT_LIBRARY=/path/to/libquat.so
+VRPN_ROOT=/path/to/vrpn ./scripts/build.sh --clean
 ```
 
 ## 默认值
