@@ -39,6 +39,10 @@ if command -v apt-get >/dev/null 2>&1; then
       echo "sudo not found; rerun as root or pass --no-sudo if apt is already permitted" >&2
       exit 1
     fi
+    if ! sudo -n true 2>/dev/null; then
+      echo "sudo requires a password; run ./scripts/install-deps.sh in a terminal first, then rerun ./scripts/build.sh" >&2
+      exit 1
+    fi
     SUDO=(sudo)
   fi
 
@@ -68,8 +72,28 @@ MSG
 fi
 
 missing=0
-if ! find /usr/include /usr/local/include /opt/homebrew/include /opt/homebrew/opt/vrpn/include /usr/local/opt/vrpn/include /opt/local/include \
-    -name vrpn_Tracker.h -print -quit 2>/dev/null | grep -q .; then
+include_paths=(
+  /usr/include
+  /usr/local/include
+  /usr/local/opt/vrpn/include
+  /opt/homebrew/include
+  /opt/homebrew/opt/vrpn/include
+  /opt/local/include
+)
+if [[ -n "${VRPN_ROOT:-}" ]]; then
+  include_paths+=("${VRPN_ROOT}/include")
+fi
+if [[ -n "${HOMEBREW_PREFIX:-}" ]]; then
+  include_paths+=("${HOMEBREW_PREFIX}/include" "${HOMEBREW_PREFIX}/opt/vrpn/include")
+fi
+if command -v brew >/dev/null 2>&1; then
+  brew_vrpn_prefix="$(brew --prefix vrpn 2>/dev/null || true)"
+  if [[ -n "${brew_vrpn_prefix}" ]]; then
+    include_paths+=("${brew_vrpn_prefix}/include")
+  fi
+fi
+
+if ! find "${include_paths[@]}" -name vrpn_Tracker.h -print -quit 2>/dev/null | grep -q .; then
   echo "warning: vrpn_Tracker.h was not found in common include paths" >&2
   missing=1
 fi

@@ -36,9 +36,9 @@ find_library(QUAT_LIBRARY
 
 include(FindPackageHandleStandardArgs)
 find_package_handle_standard_args(VRPN
-  REQUIRED_VARS VRPN_INCLUDE_DIR VRPN_LIBRARY QUAT_LIBRARY
+  REQUIRED_VARS VRPN_INCLUDE_DIR VRPN_LIBRARY
   REASON_FAILURE_MESSAGE
-    "Install VRPN development files or set VRPN_ROOT, CMAKE_PREFIX_PATH, VRPN_INCLUDE_DIR, VRPN_LIBRARY and QUAT_LIBRARY. On macOS with Homebrew, try: brew install vrpn"
+    "Install VRPN development files or set VRPN_ROOT, CMAKE_PREFIX_PATH, VRPN_INCLUDE_DIR and VRPN_LIBRARY."
 )
 
 if(VRPN_FOUND AND NOT TARGET VRPN::vrpn)
@@ -46,8 +46,12 @@ if(VRPN_FOUND AND NOT TARGET VRPN::vrpn)
   set_target_properties(VRPN::vrpn PROPERTIES
     IMPORTED_LOCATION "${VRPN_LIBRARY}"
     INTERFACE_INCLUDE_DIRECTORIES "${VRPN_INCLUDE_DIR}"
-    INTERFACE_LINK_LIBRARIES "${QUAT_LIBRARY}"
   )
+  if(QUAT_LIBRARY)
+    set_property(TARGET VRPN::vrpn APPEND PROPERTY
+      INTERFACE_LINK_LIBRARIES "${QUAT_LIBRARY}"
+    )
+  endif()
 endif()
 
 unset(_VRPN_HINTS)

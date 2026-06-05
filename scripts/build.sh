@@ -7,7 +7,8 @@ SOURCE_DIR="${REPO_DIR}/native/vrpn_mqtt_bridge"
 BUILD_DIR="${REPO_DIR}/native/vrpn_mqtt_bridge/build"
 CLEAN=0
 AUTO_INSTALL_DEPS=1
-declare -a EXTRA_CMAKE_ARGS=()
+CMAKE_ONLY=0
+EXTRA_CMAKE_ARGS=()
 
 usage() {
   cat <<'USAGE'
@@ -18,6 +19,7 @@ Build the C++ VRPN-to-MQTT bridge.
 Options:
   --build-dir DIR   CMake build directory (default: native/vrpn_mqtt_bridge/build)
   --cmake-arg ARG   Extra argument passed to cmake configure; can be repeated
+  --cmake-only      Run cmake configure/build directly without dependency handling
   --clean           Remove the build directory before configuring
   --no-install-deps Do not auto-install missing cmake/VRPN dependencies
   -h, --help        Show this help
@@ -25,7 +27,7 @@ Options:
 Environment:
   AUTO_INSTALL_DEPS Set to false/0/no to disable dependency auto-install
   BUILD_JOBS        Parallel build jobs (default: 2)
-  CMAKE_ARGS        Extra cmake configure arguments, split by shell words
+  CMAKE_ARGS        Extra cmake configure arguments
   VRPN_ROOT         VRPN install prefix used by native/cmake/FindVRPN.cmake
 USAGE
 }
@@ -89,6 +91,11 @@ while [[ $# -gt 0 ]]; do
       CLEAN=1
       shift
       ;;
+    --cmake-only)
+      CMAKE_ONLY=1
+      AUTO_INSTALL_DEPS=0
+      shift
+      ;;
     --no-install-deps)
       AUTO_INSTALL_DEPS=0
       shift
@@ -149,21 +156,29 @@ fi
 
 if [[ -n "${CMAKE_ARGS:-}" ]]; then
   read -r -a env_cmake_args <<<"${CMAKE_ARGS}"
-  EXTRA_CMAKE_ARGS+=("${env_cmake_args[@]}")
+  for arg in "${env_cmake_args[@]}"; do
+    EXTRA_CMAKE_ARGS+=("${arg}")
+  done
 fi
 
 mkdir -p "${BUILD_DIR}"
 CONFIGURE_LOG="${BUILD_DIR}/cmake-configure.log"
 
 configure() {
-  cmake -S "${SOURCE_DIR}" -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE=Release "${EXTRA_CMAKE_ARGS[@]}" 2>&1 | tee "${CONFIGURE_LOG}"
+  if [[ "${#EXTRA_CMAKE_ARGS[@]}" -gt 0 ]]; then
+    cmake -S "${SOURCE_DIR}" -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE=Release "${EXTRA_CMAKE_ARGS[@]}" 2>&1 | tee "${CONFIGURE_LOG}"
+  else
+    cmake -S "${SOURCE_DIR}" -B "${BUILD_DIR}" -DCMAKE_BUILD_TYPE=Release 2>&1 | tee "${CONFIGURE_LOG}"
+  fi
 }
 
 configure_failed_for_dependencies() {
   grep -Eqi 'Could NOT find VRPN|FindVRPN|VRPN.*not found|vrpn_Tracker\.h|libvrpn|libquat|CMAKE_CXX_COMPILER|No CMAKE_CXX_COMPILER|CXX compiler' "${CONFIGURE_LOG}"
 }
 
-if ! configure; then
+if [[ "${CMAKE_ONLY}" -eq 1 ]]; then
+  configure
+elif ! configure; then
   if [[ "${AUTO_INSTALL_DEPS}" -ne 1 ]]; then
     echo "cmake configure failed; install missing dependencies or rerun without --no-install-deps" >&2
     exit 1
